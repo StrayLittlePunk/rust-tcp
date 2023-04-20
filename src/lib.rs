@@ -14,6 +14,7 @@ use tun_tap::{Iface, Mode};
 struct FooBar {
     manager: Mutex<ConnectionManager>,
     pending_var: Condvar,
+    rcv_var: Condvar,
 }
 type InterfaceHandle = Arc<FooBar>;
 
@@ -82,9 +83,18 @@ fn packet_loop(nic: Iface, cm: InterfaceHandle) -> io::Result<()> {
                         match m.connections.entry(q) {
                             Entry::Occupied(mut c) => {
                                 eprintln!("got packet for known quad: {q:?}");
-                                c.get_mut()
+                                let a = c
+                                    .get_mut()
                                     .on_packet(&nic, tcph, &buf[datai..nbytes])
                                     .unwrap();
+                                //TODO compare before/after
+                                drop(mg);
+                                if a.contains(tcp::Available::READ) {
+                                    cm.rcv_var.notify_all();
+                                }
+                                if a.contains(tcp::Available::WRITE) {
+                                    // cm.snd_var.notify_all();
+                                }
                             }
                             Entry::Vacant(e) => {
                                 eprintln!("got packet for unknown quad: {q:?}");
@@ -166,30 +176,32 @@ pub struct TcpStream {
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut cm = self.cm.manager.lock().unwrap();
-        let c = cm.connections.get_mut(&self.quad).ok_or(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            "stream was terminated unexpectedly",
-        ))?;
+        loop {
+            let c = cm.connections.get_mut(&self.quad).ok_or(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "stream was terminated unexpectedly",
+            ))?;
+            if c.is_rev_closed() && c.incoming.is_empty() {
+                // no more data to read, no need to block, because there won't be any more
+                return Ok(0);
+            }
 
-        if c.incoming.is_empty() {
-            //TODO block
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "no bytes to read",
-            ));
+            if !c.incoming.is_empty() {
+                //TODO: detect FIN and return nread == 0
+                let mut nread = 0;
+                let (head, tail) = c.incoming.as_slices();
+                let hread = buf.len().min(head.len());
+                buf.copy_from_slice(&head[..hread]);
+                nread += hread;
+                let tread = (buf.len() - nread).min(tail.len());
+                buf.copy_from_slice(&tail[..tread]);
+                nread += tread;
+                drop(c.incoming.drain(..nread));
+                return Ok(nread);
+            }
+
+            cm = self.cm.rcv_var.wait(cm).unwrap();
         }
-        //TODO: detect FIN and return nread == 0
-        let mut nread = 0;
-        let (head, tail) = c.incoming.as_slices();
-        let hread = buf.len().min(head.len());
-        buf.copy_from_slice(&head[..hread]);
-        nread += hread;
-        let tread = (buf.len() - nread).min(tail.len());
-        buf.copy_from_slice(&tail[..tread]);
-        nread += tread;
-        drop(c.incoming.drain(..nread));
-
-        Ok(nread)
     }
 }
 

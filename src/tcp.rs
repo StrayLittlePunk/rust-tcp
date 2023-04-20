@@ -1,8 +1,17 @@
 use std::net::Ipv4Addr;
 use std::{collections::VecDeque, io};
 
+use bitflags::bitflags;
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice, WriteError};
 use tun_tap::Iface;
+
+bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(crate) struct Available: u8 {
+        const READ =  0b00000001;
+        const WRITE = 0b00000010;
+    }
+}
 
 #[derive(Debug)]
 pub enum State {
@@ -32,6 +41,27 @@ pub struct Connection {
 
     pub(crate) incoming: VecDeque<u8>,
     pub(crate) unacked: VecDeque<u8>,
+}
+
+impl Connection {
+    pub(crate) fn is_rev_closed(&self) -> bool {
+        if let State::TimeWait = self.state {
+            // TODO: any state after recv FIN, so alose CLOSE-WAIT LAST-ACK  CLOSED CLOSING
+            true
+        } else {
+            false
+        }
+    }
+
+    fn availablity(&self) -> Available {
+        let mut a = Available::empty();
+        if self.is_rev_closed() || !self.incoming.is_empty() {
+            a |= Available::READ;
+        }
+        //TODO: take into account self.state
+        //TODO: set Available::WRITE
+        a
+    }
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
@@ -96,12 +126,12 @@ struct RecvSequenceSpace {
 }
 
 impl Connection {
-    pub fn on_packet<'a>(
+    pub(crate) fn on_packet<'a>(
         &mut self,
         nic: &Iface,
         tcph: TcpHeaderSlice<'a>,
         data: &'a [u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Available> {
         //
         // valid segment check
         // RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
@@ -141,8 +171,9 @@ impl Connection {
             }
         };
         if !okay {
+            println!("NOT OKEY");
             self.write(nic, &[])?;
-            return Ok(());
+            return Ok(self.availablity());
         }
         self.recv.nxt = seqn.wrapping_add(slen);
 
@@ -150,7 +181,8 @@ impl Connection {
         // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 
         if !tcph.ack() {
-            return Ok(());
+            println!("NOT ACK");
+            return Ok(self.availablity());
         }
 
         let ackn = tcph.acknowledgment_number();
@@ -179,10 +211,9 @@ impl Connection {
         //    self.state = State::FinWait1;
         //}
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
-            if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-                return Ok(());
+            if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+                self.send.una = ackn;
             }
-            self.send.una = ackn;
             //TODO
             assert!(data.is_empty());
 
@@ -200,6 +231,7 @@ impl Connection {
                 self.state = State::FinWait2
             }
         }
+        eprintln!("run timewait {:?} {}", self.state, tcph.fin());
         if let State::FinWait2 = self.state {
             if tcph.fin() {
                 // we're done with the connection!
@@ -207,7 +239,7 @@ impl Connection {
                 self.state = State::TimeWait;
             }
         }
-        Ok(())
+        Ok(self.availablity())
     }
 
     pub fn accept<'a>(

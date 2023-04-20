@@ -1,5 +1,5 @@
-use std::io;
 use std::net::Ipv4Addr;
+use std::{collections::VecDeque, io};
 
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice, WriteError};
 use tun_tap::Iface;
@@ -29,6 +29,9 @@ pub struct Connection {
     recv: RecvSequenceSpace,
     ip: Ipv4Header,
     tcp: TcpHeader,
+
+    pub(crate) incoming: VecDeque<u8>,
+    pub(crate) unacked: VecDeque<u8>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
@@ -96,7 +99,6 @@ impl Connection {
     pub fn on_packet<'a>(
         &mut self,
         nic: &Iface,
-        iph: Ipv4HeaderSlice<'a>,
         tcph: TcpHeaderSlice<'a>,
         data: &'a [u8],
     ) -> io::Result<()> {
@@ -246,6 +248,8 @@ impl Connection {
                 iph.source_addr().octets(),
             ),
             tcp: TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, wnd),
+            incoming: Default::default(),
+            unacked: Default::default(),
         };
 
         c.tcp.syn = true;
@@ -339,51 +343,18 @@ impl Connection {
         Ok(())
     }
 }
-fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
-    use std::cmp::Ordering;
 
-    match start.cmp(&x) {
-        Ordering::Equal => return false,
-        Ordering::Less => {
-            // we have:
-            // 0 |------------S------X----------------| (wraparound)
-            // X is between S and E (S < X < E) in these cases:
-            //
-            // 0 |------------S------X--E-------------| (wraparound)
-            // 0 |----------E--S------X---------------| (wraparound)
-            // but *not* in these cases
-            //
-            // 0 |-------------S--E---X---------------| (wraparound)
-            // 0 |-------------|------X---------------| (wraparound)
-            //                 ^ S+E
-            //
-            // 0 |-------------S------|---------------| (wraparound)
-            //                        ^ X+E
-            // or in other words, iff !(S <= E <= X)
-            if end >= start && end <= x {
-                return false;
-            }
-        }
-        Ordering::Greater => {
-            // we have:
-            // 0 |------------X------S----------------| (wraparound)
-            // X is between S and E (S < X < E) *only* in these cases:
-            //
-            // 0 |-----------X------E---S-------------| (wraparound)
-            // but *not* in these cases
-            //
-            // 0 |-------------X--S---E---------------| (wraparound)
-            // 0 |-------------E--X---S---------------| (wraparound)
-            // 0 |-------------|------S---------------| (wraparound)
-            //                 ^ X+E
-            // 0 |-------------X------|---------------| (wraparound)
-            //                        ^ S+E
-            // or, in other words, iff S < E < X
-            if end < start && end > x {
-            } else {
-                return false;
-            }
-        }
-    }
-    true
+fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
+    // From RFC1323:
+    //     TCP determines if a data segment is "old" or "new" by testing
+    //     whether its sequence number is within 2**31 bytes of the left edge
+    //     of the window, and if it is not, discarding the data as "old".  To
+    //     insure that new data is never mistakenly considered old and vice-
+    //     versa, the left edge of the sender's window has to be at most
+    //     2**31 away from the right edge of the receiver's window.
+    lhs.wrapping_sub(rhs) > 2 ^ 31
+}
+
+fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
+    wrapping_lt(start, x) && wrapping_lt(x, end)
 }

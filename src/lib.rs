@@ -3,12 +3,15 @@ pub mod tcp;
 use std::{
     collections::{hash_map::Entry, HashMap, VecDeque},
     io::{self, Read, Write},
+    os::fd::AsRawFd,
     sync::{Arc, Condvar, Mutex},
     thread,
 };
 
 use etherparse::Ipv4HeaderSlice;
 use tun_tap::{Iface, Mode};
+
+use crate::tcp::State;
 
 #[derive(Default)]
 struct FooBar {
@@ -47,6 +50,23 @@ impl Drop for Interface {
 fn packet_loop(nic: Iface, cm: InterfaceHandle) -> io::Result<()> {
     let mut buf = [0u8; 1504];
     loop {
+        // we want to read from nic, but we want to make sure that we'll wake up when then next
+        // timer has to be triggered!
+        let mut pfd = [nix::poll::PollFd::new(
+            nic.as_raw_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        let fut = nix::poll::poll(&mut pfd, 1).map_err(io::Error::from)?;
+        assert_ne!(fut, -1);
+        if fut == 0 {
+            let mut mg = cm.manager.lock().unwrap();
+            for connection in mg.connections.values_mut() {
+                connection.on_tick(&nic)?;
+            }
+            continue;
+        }
+        assert_eq!(fut, 1);
+
         // TODO: set a timeout for this recv for TCP timers or ConnectionManager::terminate
         let nbytes = nic.recv(buf.as_mut_slice())?;
         if nbytes == 0 {
@@ -142,9 +162,12 @@ impl Interface {
                     eprintln!("packet loop has error: {e}");
                 }
             })
-            .into()
         };
-        Ok(Self { cm: Some(cm), jh })
+
+        Ok(Self {
+            cm: Some(cm),
+            jh: Some(jh),
+        })
     }
 
     pub fn bind(&mut self, port: u16) -> io::Result<TcpListener> {
@@ -222,6 +245,7 @@ impl Write for TcpStream {
 
         let nwrite = buf.len().min(SENDQUEUE_SIZE - c.unacked.len());
         c.unacked.extend(&buf[..nwrite]);
+        println!("{:x?}", c.unacked);
         // TODO: wrak up writer
         Ok(nwrite)
     }
@@ -247,8 +271,13 @@ impl Write for TcpStream {
 
 impl TcpStream {
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        // TODO: send FIN on cm.connections[quad]
-        //  unimplemented!()
+        let mut cm = self.cm.manager.lock().unwrap();
+        let c = cm.connections.get_mut(&self.quad).ok_or(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "stream was terminated unexpectedly",
+        ))?;
+
+        c.close();
         Ok(())
     }
 }

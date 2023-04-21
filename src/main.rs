@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read},
+    io::{self, Read, Write},
     thread,
 };
 
@@ -13,6 +13,8 @@ fn main() -> io::Result<()> {
         let mut buf = [0u8; 512];
         while let Ok(mut stream) = t1.accept() {
             eprintln!("get connection on 9000");
+            stream.write(b"hello from rust-tcp\n").unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
             loop {
                 let n = stream.read(&mut buf).unwrap();
                 println!("read {}b data", n);
@@ -20,6 +22,7 @@ fn main() -> io::Result<()> {
                     println!("{}", std::str::from_utf8(&buf[..n]).unwrap());
                 } else {
                     println!("no more data");
+                    stream.shutdown(std::net::Shutdown::Write).unwrap();
                     break;
                 }
             }
